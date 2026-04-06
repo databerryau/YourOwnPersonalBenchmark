@@ -1,0 +1,42 @@
+# config.yaml — model list and run settings
+# API keys / tokens are NEVER stored here.
+# Put them in .secrets (gitignored) — see .secrets.example
+
+models:
+  - name: claude-sonnet-4-6
+    provider: anthropic
+    api_key_env: ANTHROPIC_API_KEY      # reads from .secrets or env
+
+  # - name: gpt-4o
+  #   provider: openai
+  #   api_key_env: OPENAI_API_KEY
+
+  # ── Local / self-hosted models (no API key required) ────────────────────
+  # Any OpenAI-compatible endpoint (Ollama, LM Studio, llama.cpp server, etc.)
+  #
+  # - name: llama3.2:latest              # model name as the server knows it
+  #   provider: local
+  #   base_url: http://localhost:11434/v1  # Ollama default
+  #   api_key_env: ~                       # leave null — no key needed
+  #
+  # - name: mistral-7b-instruct
+  #   provider: local
+  #   base_url: http://localhost:1234/v1   # LM Studio default
+  #   api_key_env: ~
+
+  # ── Additional hosted endpoints (Azure, Together, Fireworks, etc.) ───────
+  # - name: meta-llama/Meta-Llama-3-70B-Instruct
+  #   provider: openai_compat             # OpenAI-compatible hosted API
+  #   base_url: https://api.together.xyz/v1
+  #   api_key_env: TOGETHER_API_KEY       # key name in .secrets
+
+scoring:
+  judge_model: claude-sonnet-4-6
+  judge_provider: anthropic
+  judge_api_key_env: ANTHROPIC_API_KEY   # explicit — can differ from the models above
+
+settings:
+  runs_per_question: 3
+  demographic_runs: 10
+  temperature: 1.0
+  max_tokens: 2048

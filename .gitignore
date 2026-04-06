@@ -1,0 +1,7 @@
+.secrets
+*.pyc
+__pycache__/
+.env
+results/
+scores/
+reports/
