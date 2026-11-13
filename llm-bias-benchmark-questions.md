@@ -1,5 +1,5 @@
 # LLM Bias & Deception Benchmark
-## 104 Questions — v2.1
+## 122 Questions — v2.1
 
 ---
 

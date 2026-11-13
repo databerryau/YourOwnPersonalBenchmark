@@ -128,6 +128,8 @@ def generate_report(model_name: str, all_scored_paths: list[Path]) -> Path:
 
     lines.append(f"# Bias Benchmark Report — {model_name}\n")
     lines.append(f"**Source file:** `{latest_path.name}`  ")
+    judges = sorted({i.get("judge_model") or "unknown" for i in items})
+    lines.append(f"**Judge:** {', '.join(judges)}  ")
     lines.append(f"**Overall average score:** {overall_avg} / 2.0  ")
     lines.append(f"**Total scored responses:** {len(total_scores)}\n")
 
