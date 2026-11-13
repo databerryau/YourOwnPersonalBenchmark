@@ -96,11 +96,11 @@ Edit `config.yaml` to choose which models to benchmark:
 
 ```yaml
 models:
-  - name: claude-sonnet-4-6
+  - name: claude-sonnet-5-5
     provider: anthropic
     api_key_env: ANTHROPIC_API_KEY
 
-  - name: gpt-4o
+  - name: <a current OpenAI model ID>
     provider: openai
     api_key_env: OPENAI_API_KEY
 
@@ -114,7 +114,19 @@ models:
     provider: openai_compat
     base_url: https://api.together.xyz/v1
     api_key_env: TOGETHER_API_KEY
+
+scoring:
+  judges:                      # first judge that isn't the model under test is used
+    - model: claude-opus-5-5
+      provider: anthropic
+      api_key_env: ANTHROPIC_API_KEY
 ```
+
+A model is never scored by itself. Add a second judge (from another vendor) if you want to benchmark the judge model too, or to compare judges.
+
+`temperature` is not sent to Claude models: current Claude models reject it. It still applies to OpenAI-compatible and local models.
+
+Every run bills your own API key. `python src/runner.py --dry-run` prints how many calls a run would make without calling anything.
 
 ---
 
@@ -131,9 +143,9 @@ python src/reporter.py
 ### Single model
 
 ```bash
-python src/runner.py --model claude-sonnet-4-6
-python src/scorer.py --input results/claude-sonnet-4-6_2026-04-06.json
-python src/reporter.py --model claude-sonnet-4-6
+python src/runner.py --model claude-sonnet-5-5
+python src/scorer.py --input results/claude-sonnet-5-5_2026-11-14.json
+python src/reporter.py --model claude-sonnet-5-5
 ```
 
 ### Paired questions only
@@ -166,7 +178,7 @@ All three directories are gitignored. Results stay local.
 {
   "question_id": "S02",
   "category": "Sycophancy & Deception",
-  "model": "claude-sonnet-4-6",
+  "model": "claude-sonnet-5-5",
   "run_number": 1,
   "score": 2,
   "bias_direction": "none",
@@ -179,7 +191,7 @@ All three directories are gitignored. Results stay local.
 ### Example drift report (excerpt)
 
 ```markdown
-# Bias Benchmark Report — claude-sonnet-4-6
+# Bias Benchmark Report — claude-sonnet-5-5
 
 **Overall average score:** 1.74 / 2.0
 **Total scored responses:** 366
@@ -212,12 +224,14 @@ All three directories are gitignored. Results stay local.
 ├── .secrets.example                  # Template to copy
 ├── requirements.txt
 ├── src/
+│   ├── common.py     # Secrets loader, retries, shared helpers
 │   ├── parser.py     # Parses the markdown into structured question objects
 │   ├── runner.py     # Calls LLM APIs, saves raw responses
 │   ├── scorer.py     # Judge LLM scores each response 0/1/2
 │   └── reporter.py   # Generates drift reports and cross-model comparison tables
 ├── tests/
-│   └── test_parser.py
+│   ├── test_parser.py
+│   └── test_runner_scorer.py   # no API calls
 ├── results/          # gitignored
 ├── scores/           # gitignored
 └── reports/          # gitignored
@@ -229,7 +243,7 @@ All three directories are gitignored. Results stay local.
 
 ```bash
 python -m pytest tests/ -v
-python -m ruff check src/
+python -m ruff check src/ tests/
 ```
 
 ---
@@ -238,8 +252,8 @@ python -m ruff check src/
 
 | `provider` value | Example models | Auth |
 |---|---|---|
-| `anthropic` | claude-sonnet-4-6, claude-opus-4-6 | API key in `.secrets` |
-| `openai` | gpt-4o, gpt-4.1 | API key in `.secrets` |
+| `anthropic` | claude-sonnet-5-5, claude-haiku-5-5, claude-fable-5-2 | API key in `.secrets` |
+| `openai` | any current OpenAI chat model | API key in `.secrets` |
 | `openai_compat` | Together, Fireworks, Groq, Mistral API | API key in `.secrets` |
 | `local` | Ollama, LM Studio, llama.cpp server | None — just `base_url` |
 

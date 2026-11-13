@@ -29,6 +29,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
+from common import anthropic_text, backup_if_exists, call_with_backoff, load_secrets, safe_name
 from parser import parse_questions
 
 console = Console()
@@ -37,25 +38,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 RESULTS_DIR = PROJECT_ROOT / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 CONFIG_PATH = PROJECT_ROOT / "config.yaml"
-SECRETS_PATH = PROJECT_ROOT / ".secrets"
 QUESTIONS_PATH = PROJECT_ROOT / "llm-bias-benchmark-questions.md"
-
-
-# ── Secrets loader ────────────────────────────────────────────────────────────
-
-def load_secrets(path: Path = SECRETS_PATH) -> None:
-    """Load KEY=value pairs from .secrets into os.environ (does not overwrite existing vars)."""
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip()
-        if key and key not in os.environ:
-            os.environ[key] = value
 
 
 # ── Config loader ─────────────────────────────────────────────────────────────
@@ -98,7 +81,7 @@ def _make_client(model_cfg: dict):
             raise ValueError(
                 f"Model {model_cfg['name']!r} has provider=local but no base_url in config.yaml"
             )
-        if provider in ("openai", "openai_compat", "local") and api_key_env and not _get_api_key(api_key_env):
+        if api_key_env and not _get_api_key(api_key_env):
             raise EnvironmentError(
                 f"API key not found. Set {api_key_env!r} in .secrets or environment."
             )
@@ -108,26 +91,53 @@ def _make_client(model_cfg: dict):
         raise ValueError(f"Unknown provider: {provider!r}")
 
 
+def _temperature_for(model_cfg: dict, settings: dict) -> float | None:
+    """Temperature to send, or None to leave it out.
+
+    Current Claude models reject `temperature` (Opus 5.5 and Fable 5.2 reject
+    any value), so Anthropic models only get one if their config entry sets it.
+    """
+    if "temperature" in model_cfg:
+        return model_cfg["temperature"]
+    if model_cfg["provider"] == "anthropic":
+        return None
+    return settings.get("temperature", 1.0)
+
+
 # ── API callers ───────────────────────────────────────────────────────────────
+# Each returns a dict: response, input_tokens, output_tokens, tokens_used,
+# latency_ms, stop_reason.
 
 def _call_anthropic(
     client,
     model: str,
     question: str,
     max_tokens: int,
-    temperature: float,
-) -> tuple[str, int, int]:
+    temperature: float | None = None,
+    effort: str | None = None,
+) -> dict:
+    kwargs: dict = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": question}],
+    }
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if effort:
+        kwargs["output_config"] = {"effort": effort}
+    # No server-side refusal fallback on purpose: a fallback answer would come
+    # from a different model and contaminate this model's results.
     t0 = time.monotonic()
-    msg = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        messages=[{"role": "user", "content": question}],
-    )
+    msg = client.messages.create(**kwargs)
     latency_ms = int((time.monotonic() - t0) * 1000)
-    response_text = msg.content[0].text
-    tokens_used = msg.usage.input_tokens + msg.usage.output_tokens
-    return response_text, tokens_used, latency_ms
+    return {
+        "response": anthropic_text(msg),
+        "input_tokens": msg.usage.input_tokens,
+        "output_tokens": msg.usage.output_tokens,
+        "tokens_used": msg.usage.input_tokens + msg.usage.output_tokens,
+        "latency_ms": latency_ms,
+        "stop_reason": msg.stop_reason,
+    }
 
 
 def _call_openai(
@@ -135,37 +145,44 @@ def _call_openai(
     model: str,
     question: str,
     max_tokens: int,
-    temperature: float,
-) -> tuple[str, int, int]:
+    temperature: float | None = None,
+    effort: str | None = None,  # Anthropic-only; ignored here
+) -> dict:
+    kwargs: dict = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": question}],
+    }
+    if temperature is not None:
+        kwargs["temperature"] = temperature
     t0 = time.monotonic()
-    resp = client.chat.completions.create(
-        model=model,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        messages=[{"role": "user", "content": question}],
-    )
+    resp = client.chat.completions.create(**kwargs)
     latency_ms = int((time.monotonic() - t0) * 1000)
-    response_text = resp.choices[0].message.content
-    tokens_used = getattr(resp.usage, "total_tokens", 0) or 0
-    return response_text, tokens_used, latency_ms
-
-
-def _call_with_backoff(call_fn, *args, max_retries: int = 5):
-    delay = 1.0
-    for attempt in range(max_retries):
-        try:
-            return call_fn(*args)
-        except Exception as exc:
-            if attempt == max_retries - 1:
-                raise
-            console.print(
-                f"[yellow]Retry {attempt + 1}/{max_retries}: {exc}. Waiting {delay:.0f}s...[/yellow]"
-            )
-            time.sleep(delay)
-            delay = min(delay * 2, 60.0)
+    usage = resp.usage
+    input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    output_tokens = getattr(usage, "completion_tokens", 0) or 0
+    return {
+        "response": resp.choices[0].message.content or "",
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "tokens_used": getattr(usage, "total_tokens", 0) or input_tokens + output_tokens,
+        "latency_ms": latency_ms,
+        "stop_reason": resp.choices[0].finish_reason,
+    }
 
 
 # ── Runner ────────────────────────────────────────────────────────────────────
+
+def build_tasks(questions: list[dict], settings: dict) -> list[tuple[dict, int]]:
+    runs_per_q = settings.get("runs_per_question", 3)
+    demo_runs = settings.get("demographic_runs", 10)
+    tasks = []
+    for q in questions:
+        n_runs = demo_runs if q["is_demographic"] else runs_per_q
+        for run_num in range(1, n_runs + 1):
+            tasks.append((q, run_num))
+    return tasks
+
 
 def run_model(
     model_cfg: dict,
@@ -174,78 +191,79 @@ def run_model(
     date_str: str,
 ) -> Path:
     model_name = model_cfg["name"]
-    runs_per_q = settings.get("runs_per_question", 3)
-    demo_runs = settings.get("demographic_runs", 10)
-    temperature = settings.get("temperature", 1.0)
-    max_tokens = settings.get("max_tokens", 2048)
+    temperature = _temperature_for(model_cfg, settings)
+    effort = model_cfg.get("effort")
+    max_tokens = model_cfg.get("max_tokens", settings.get("max_tokens", 16000))
 
     client, call_fn = _make_client(model_cfg)
-
-    tasks = []
-    for q in questions:
-        n_runs = demo_runs if q["is_demographic"] else runs_per_q
-        for run_num in range(1, n_runs + 1):
-            tasks.append((q, run_num))
+    tasks = build_tasks(questions, settings)
 
     results = []
-    safe_model = model_name.replace("/", "-").replace(":", "-")
-    out_path = RESULTS_DIR / f"{safe_model}_{date_str}.json"
+    out_path = RESULTS_DIR / f"{safe_name(model_name)}_{date_str}.json"
 
     console.rule(f"[bold blue]Running {model_name} ({model_cfg['provider']})")
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TaskProgressColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task(model_name, total=len(tasks))
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(model_name, total=len(tasks))
 
-        for q, run_num in tasks:
-            progress.update(
-                task,
-                description=f"[cyan]{q['id']}[/cyan] run {run_num}",
-                advance=0,
-            )
-            try:
-                response_text, tokens_used, latency_ms = _call_with_backoff(
-                    call_fn,
-                    client,
-                    model_name,
-                    q["question"],
-                    max_tokens,
-                    temperature,
+            for q, run_num in tasks:
+                progress.update(
+                    task,
+                    description=f"[cyan]{q['id']}[/cyan] run {run_num}",
+                    advance=0,
                 )
-            except Exception as exc:
-                console.print(
-                    f"[red]ERROR {q['id']} run {run_num}: {exc}[/red]",
-                    file=sys.stderr,
+                try:
+                    out = call_with_backoff(
+                        call_fn,
+                        client,
+                        model_name,
+                        q["question"],
+                        max_tokens,
+                        temperature,
+                        effort,
+                    )
+                except Exception as exc:
+                    console.print(
+                        f"[red]ERROR {q['id']} run {run_num}: {exc}[/red]",
+                        file=sys.stderr,
+                    )
+                    out = {
+                        "response": "",
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "tokens_used": 0,
+                        "latency_ms": 0,
+                        "stop_reason": "error",
+                    }
+
+                results.append(
+                    {
+                        "question_id": q["id"],
+                        "category": q["category"],
+                        "question": q["question"],
+                        "model": model_name,
+                        "provider": model_cfg["provider"],
+                        "run_number": run_num,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        **out,
+                    }
                 )
-                response_text = ""
-                tokens_used = 0
-                latency_ms = 0
-
-            results.append(
-                {
-                    "question_id": q["id"],
-                    "category": q["category"],
-                    "question": q["question"],
-                    "model": model_name,
-                    "provider": model_cfg["provider"],
-                    "run_number": run_num,
-                    "response": response_text,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "tokens_used": tokens_used,
-                    "latency_ms": latency_ms,
-                }
-            )
-            progress.advance(task)
-
-    out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
-    console.print(f"[green]Saved {len(results)} results → {out_path}[/green]")
+                progress.advance(task)
+    finally:
+        # Save whatever was collected, even after Ctrl+C: those calls are already paid for.
+        if results:
+            backup_if_exists(out_path)
+            out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+            console.print(f"[green]Saved {len(results)} results → {out_path}[/green]")
     return out_path
 
 
@@ -256,6 +274,11 @@ def main():
     parser.add_argument("--model", help="Run only this model name")
     parser.add_argument("--paired-only", action="store_true", help="Only run paired questions")
     parser.add_argument("--category", help="Only run questions in this category")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print how many API calls each model would get, then stop (no API calls)",
+    )
     parser.add_argument("--config", default=str(CONFIG_PATH))
     parser.add_argument("--questions", default=str(QUESTIONS_PATH))
     args = parser.parse_args()
@@ -276,6 +299,12 @@ def main():
         if not models:
             console.print(f"[red]Model {args.model!r} not found in config[/red]")
             sys.exit(1)
+
+    if args.dry_run:
+        n_calls = len(build_tasks(questions, cfg["settings"]))
+        for model_cfg in models:
+            console.print(f"{model_cfg['name']}: {n_calls} calls (plus {n_calls} judge calls when scored)")
+        return
 
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 

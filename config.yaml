@@ -1,12 +1,28 @@
-# config.yaml — model list and run settings
+# config.yaml — model list and run settings. This repo is PUBLIC.
 # API keys / tokens are NEVER stored here.
 # Put them in .secrets (gitignored) — see .secrets.example
 
 models:
-  - name: claude-sonnet-4-6
+  # Subjects: the models being benchmarked.
+  # Optional keys per model:
+  #   effort: low | medium | high | xhigh | max   (Anthropic only; leave out to use the model's default)
+  #   temperature: 0.7      (only for models that accept it; current Claude models reject it)
+  #   max_tokens: 16000     (overrides settings.max_tokens)
+  - name: claude-sonnet-5-5
     provider: anthropic
     api_key_env: ANTHROPIC_API_KEY      # reads from .secrets or env
 
+  - name: claude-haiku-5-5
+    provider: anthropic
+    api_key_env: ANTHROPIC_API_KEY
+
+  - name: claude-fable-5-2
+    provider: anthropic
+    api_key_env: ANTHROPIC_API_KEY
+
+  # ── OpenAI: NEEDS A CURRENT MODEL ID FROM THE USER ──────────────────────
+  # gpt-4o is out of date. Ask the user which OpenAI model to use before
+  # uncommenting, and check it accepts max_tokens and temperature.
   # - name: gpt-4o
   #   provider: openai
   #   api_key_env: OPENAI_API_KEY
@@ -31,12 +47,25 @@ models:
   #   api_key_env: TOGETHER_API_KEY       # key name in .secrets
 
 scoring:
-  judge_model: claude-sonnet-4-6
-  judge_provider: anthropic
-  judge_api_key_env: ANTHROPIC_API_KEY   # explicit — can differ from the models above
+  # Judges, in order of preference. A model is never judged by itself: for each
+  # results file the first judge that isn't the model under test writes
+  # scores/{run}_scored.json (used by reports). Any other judges write
+  # scores/{run}_scored-by-{judge}.json so their scores can be compared.
+  judges:
+    - model: claude-opus-5-5
+      provider: anthropic
+      api_key_env: ANTHROPIC_API_KEY
+      effort: medium          # Opus 5.5's default, set explicitly so scoring stays comparable over time
+      max_tokens: 4096        # thinking is always on for Opus 5.5 and counts toward this
+
+    # Optional second judge from another vendor. NEEDS A CURRENT MODEL ID FROM THE USER.
+    # - model: <current OpenAI model ID>
+    #   provider: openai
+    #   api_key_env: OPENAI_API_KEY
+    #   temperature: 0.0      # sent to non-Anthropic judges (default 0.0); set to ~ to leave it out
 
 settings:
   runs_per_question: 3
   demographic_runs: 10
-  temperature: 1.0
-  max_tokens: 2048
+  temperature: 1.0     # openai / openai_compat / local only. Never sent to Anthropic models.
+  max_tokens: 16000    # a cap, not a target. Includes thinking on current Claude models.
